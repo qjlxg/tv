@@ -1,0 +1,195 @@
+import asyncio
+import aiohttp
+import json
+import os
+import re
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
+import warnings
+from bs4 import MarkupResemblesLocatorWarning
+
+# 屏蔽 BS4 警告
+warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
+
+VOD_FILE = 'vod.txt'
+CONFIG_FILE = 'merged_tvbox_config.json'
+CONCURRENT_LIMIT = 100 
+TIMEOUT = aiohttp.ClientTimeout(total=35)
+
+# 暴力探测路径
+COMMON_PATHS = [
+    "/api.php/provide/vod/",
+    "/api.php/provide/vod/at/json/",
+    "/inc/apijson.php",
+    "/inc/api.php",
+    "/api/xml.php",
+    "/api/json.php",
+    "/jacloudapi.php/provide/vod/"
+]
+
+async def check_api(session, url):
+    """尝试验证API是否有效，支持xml自动转json测试"""
+    # 尝试转为json接口测试
+    test_url = url.replace('/at/xml/', '/at/json/').replace('.xml', '.json')
+    try:
+        async with session.get(test_url, params={'ac': 'list'}, timeout=10) as res:
+            if res.status == 200:
+                data = await res.json(content_type=None)
+                if isinstance(data, dict) and ('class' in data or 'list' in data):
+                    return test_url, data
+    except:
+        try:
+            async with session.get(url, params={'ac': 'list'}, timeout=10) as res:
+                if res.status == 200:
+                    text = await res.text()
+                    if '<rss' in text or '{"class"' in text:
+                        return url, {"class": []} 
+        except: pass
+    return None, None
+
+def parse_html_list_backup(html):
+    """启发式解析：判断HTML中是否包含 资源名+日期 的列表特征"""
+    soup = BeautifulSoup(html, 'html.parser')
+    date_pattern = re.compile(r'\d{4}-\d{2}-\d{2}')
+    date_nodes = soup.find_all(string=date_pattern)
+    
+    match_count = 0
+    for node in date_nodes:
+        parent = node.parent
+        for _ in range(4): # 向上溯源寻找链接
+            if not parent: break
+            links = parent.find_all('a', href=True)
+            if any(len(l.get_text(strip=True)) > 2 and ('detail' in l['href'] or 'id' in l['href'] or '.html' in l['href']) for l in links):
+                match_count += 1
+                break
+            parent = parent.parent
+    return match_count >= 3 # 找到3个以上此类模式即视为有效列表页
+
+async def probe_site(session, base_url, existing_names, existing_apis):
+    if not base_url.startswith('http'):
+        base_url = 'http://' + base_url
+    
+    try:
+        async with session.get(base_url, timeout=TIMEOUT) as response:
+            html = await response.text(errors='ignore')
+            
+            # 1. 提取站点名
+            soup = BeautifulSoup(html, 'html.parser')
+            title = soup.title.string.strip() if soup.title else urlparse(base_url).netloc
+            clean_name = re.sub(r'【.*?】|[-_].*|官网|官方|地址|域名|首页|采集站|资源站', '', title).strip()
+            if not clean_name: clean_name = urlparse(base_url).netloc
+
+            if clean_name in existing_names: return None
+
+            # 2. 搜刮 API 候选 (包含正则全文搜索首页公告地址)
+            candidates = set()
+            
+            # 强化正则：直接抓取网页文本中公示的任何含 api.php 等关键词的完整 URL
+            api_regex = r'https?://[^\s<>\"\'\}]+?(?:api\.php|apijson\.php|inc/api|api/json)[^\s<>\"\'\}]*'
+            found_by_re = re.findall(api_regex, html)
+            candidates.update(found_by_re)
+
+            # 传统方法：a标签探测
+            for a in soup.find_all('a', href=True):
+                if 'api' in a['href']:
+                    candidates.add(urljoin(base_url, a['href']))
+
+            # 路径盲测
+            for p in COMMON_PATHS:
+                candidates.add(urljoin(base_url, p))
+
+            # 3. 逐一验证搜刮到的 API
+            for raw_api in candidates:
+                api_url = raw_api.rstrip('./,; ')
+                if api_url in existing_apis: continue
+                
+                final_api, data = await check_api(session, api_url)
+                if final_api:
+                    cats = [c['type_name'] for c in data.get('class', [])][:12]
+                    return {
+                        "key": urlparse(base_url).netloc.replace('.', '_'),
+                        "name": clean_name,
+                        "type": 1,
+                        "api": final_api,
+                        "searchable": 1,
+                        "quickSearch": 1,
+                        "categories": cats
+                    }
+
+            # 4. 保险：API验证全失败，看是否是网页列表
+            if parse_html_list_backup(html):
+                return {
+                    "key": urlparse(base_url).netloc.replace('.', '_'),
+                    "name": clean_name + "(网页解析)",
+                    "type": 3,
+                    "api": base_url,
+                    "searchable": 1,
+                    "quickSearch": 0,
+                    "categories": ["网页列表"]
+                }
+
+            # 5. 终极保底：强制生成默认 API 路径
+            default_api = urljoin(base_url, "/api.php/provide/vod/")
+            return {
+                "key": "blind_" + urlparse(base_url).netloc.replace('.', '_'),
+                "name": clean_name + "(预设)",
+                "type": 1,
+                "api": default_api,
+                "searchable": 1,
+                "quickSearch": 1,
+                "categories": [] # 无分类
+            }
+
+    except:
+        # 连首页都请求失败的站，直接保底
+        default_api = urljoin(base_url, "/api.php/provide/vod/")
+        return {
+            "key": "err_" + urlparse(base_url).netloc.replace('.', '_'),
+            "name": urlparse(base_url).netloc + "(强行)",
+            "type": 1,
+            "api": default_api,
+            "searchable": 1,
+            "quickSearch": 1,
+            "categories": []
+        }
+    return None
+
+async def main():
+    if not os.path.exists(VOD_FILE): 
+        print(f"❌ 未找到 {VOD_FILE}")
+        return
+    
+    config_data = {"sites": []}
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            try: config_data = json.load(f)
+            except: pass
+
+    existing_names = {s['name'] for s in config_data['sites']}
+    existing_apis = {s['api'] for s in config_data['sites']}
+
+    with open(VOD_FILE, 'r', encoding='utf-8-sig') as f:
+        urls = list(set([l.strip() for l in f if l.strip() and l.startswith('http')]))
+
+    print(f"🕵️ 深度搜刮模式启动，目标: {len(urls)} 个站点...")
+    
+    connector = aiohttp.TCPConnector(limit=CONCURRENT_LIMIT, ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [probe_site(session, url, existing_names, existing_apis) for url in urls]
+        results = await asyncio.gather(*tasks)
+
+    new_added = 0
+    for site in results:
+        if site and site['api'] not in existing_apis:
+            config_data['sites'].append(site)
+            existing_apis.add(site['api'])
+            existing_names.add(site['name'])
+            new_added += 1
+
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(config_data, f, ensure_ascii=False, indent=2)
+    
+    print(f"🎉 任务完成！\n- 新增/保底入库: {new_added} 个\n- 总配置站数: {len(config_data['sites'])}")
+
+if __name__ == "__main__":
+    asyncio.run(main())

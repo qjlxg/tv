@@ -1,0 +1,36 @@
+name: update_tvbox_config
+
+on:
+  push:
+    paths:
+      - 'update_tvbox_config.py'
+      - '.github/workflows/update_tvbox_config.yml'
+      - 'vod.txt'
+  workflow_dispatch: # 支持手动运行
+
+jobs:
+  build_and_run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install aiohttp beautifulsoup4
+
+      - name: Run Async Script
+        env:
+          TZ: Asia/Shanghai
+        run: python update_tvbox_config.py
+
+      - name: Commit changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add merged_tvbox_config.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update TVBox config [$(date +'%Y-%m-%d %H:%M:%S')]" && git push)

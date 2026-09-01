@@ -1,0 +1,40 @@
+name: check_json
+
+on:
+  push:
+    paths:
+      - 'check_json.py'
+      - '.github/workflows/check_json.yml'
+      - 'merged_tvbox_config.json'
+  workflow_dispatch: # 支持手动运行
+
+jobs:
+  check_and_clean:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v3
+
+      - name: 设置 Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: 安装依赖
+        run: |
+          pip install aiohttp beautifulsoup4
+
+      - name: 执行检测脚本
+        run: |
+          # 设定系统时区为上海
+          sudo timedatectl set-timezone Asia/Shanghai
+          python check_json.py
+
+      - name: 提交更新
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add merged_tvbox_config.json
+          # 只有在文件有变动时才提交，防止报错
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: 自动清理失效站点 $(date +'%Y-%m-%d %H:%M:%S')" && git push)
